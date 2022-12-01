@@ -1,0 +1,777 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CORS redirect service; see https://github.com/prebid/cors-redirect-service
+Parameters:
+  CertificateArn:
+    Type: String
+    Description: TLS certificate ARN
+  ECRStackName:
+    Type: String
+    MinLength: 1
+    Description: Name of the CFN stack created through the `ecr.yaml` template
+  ImageTag:
+    Type: String
+    Default: test
+    Description: Docker image tag to use.
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: c6i.large
+  Redirect:
+    Type: String
+    MinLength: 1
+    Default: 'https://cdn.jsdelivr.net/gh/prebid/currency-file@1/latest.json'
+    Description: URL to redirect to
+  MinInstances:
+    Type: Number
+    Default: 2
+    Description: Minimum number of instances
+  MaxInstances:
+    Type: Number
+    Default: 10
+    Description: Maximum number of instances
+  MinContainers:
+    Type: Number
+    Default: 2
+    Description: Minimum number of containers
+  MaxContainers:
+    Type: Number
+    Default: 20
+    Description: Maximum number of containers
+  MaxConnections:
+    Type: Number
+    Default: 1024
+    Description: Maximum number of connections per container
+  ContainerTPS:
+    Type: Number
+    Default: 2000
+    Description: How many requests per second a container can serve.
+  MinTPSCapacity:
+    Type: Number
+    Default: 4000
+    Description: How many TPS the service should be able to handle at all times.
+  TargetSpareTPSCapacity:
+    Type: Number
+    Default: 1000
+    Description: Target spare capacity (in TPS). The cluster will autoscale attempting to maintain the ability to handle a surge of this many TPS.
+  NotificationEmail:
+    Type: String
+    Default: alerts@prebid.org
+    Description: Email to notify on alarms
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+Mappings:
+  Subnets:
+    VPC:
+      CIDR: '172.54.0.0/16'
+    PrivateOne:
+      CIDR: '172.54.0.0/20'
+    PrivateTwo:
+      CIDR: '172.54.16.0/20'
+    PublicOne:
+      CIDR: '172.54.32.0/20'
+    PublicTwo:
+      CIDR: '172.54.48.0/20'
+
+Resources:
+  ################## Network ##################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: false
+      CidrBlock: !FindInMap ['Subnets', 'VPC', 'CIDR']
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-vpc'
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PrivateOne', 'CIDR']
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-subnet-az1'
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PrivateTwo', 'CIDR']
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-subnet-az2'
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PublicOne', 'CIDR']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-public-subnet-az1'
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PublicTwo', 'CIDR']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-public-subnet-az2'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-igw'
+  InternetGatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-public-routing-table'
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachement
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+
+  NATGatewayOne:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNATOne.AllocationId
+      SubnetId: !Ref PublicSubnetOne
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-nat-gw-az1'
+  NATGatewayTwo:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNATTwo.AllocationId
+      SubnetId: !Ref PublicSubnetTwo
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-nat-gw-az2'
+  EIPNATOne:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachement
+    Properties:
+      Domain: vpc
+  EIPNATTwo:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachement
+    Properties:
+      Domain: vpc
+
+  PrivateRouteTableOne:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-routing-table-az1'
+  PrivateRouteOne:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGatewayOne
+  PrivateRouteTableOneAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      SubnetId: !Ref PrivateSubnetOne
+  PrivateRouteTableTwo:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-routing-table-az2'
+  PrivateRouteTwo:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGatewayTwo
+  PrivateRouteTableTwoAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      SubnetId: !Ref PrivateSubnetTwo
+
+
+  ##################### IAM  #########################
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecsInstanceRole'
+      Description: ECS instance role
+      AssumeRolePolicyDocument:
+        Version: "2008-10-17"
+        Statement:
+          - Effect: "Allow"
+            Sid: ""
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-ecsInstanceProfile'
+      Roles:
+        - !Ref EcsInstanceRole
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ecsTaskExecRole'
+      Description: ECS instance role
+      AssumeRolePolicyDocument:
+        Version: "2008-10-17"
+        Statement:
+          - Effect: "Allow"
+            Sid: ""
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  ##################### Service ######################
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-ecs-cluster'
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref EcsInstanceProfile
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              # Set any ECS agent configuration options
+              echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            - ECSCluster: !Ref ECSCluster
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to instances of auto-scaling group
+      VpcId:
+        !Ref VPC
+      SecurityGroupIngress:
+        # Allow SSH - but note that these instances are not facing the Internet; if needed, spin up an entry instance
+        # in one of the public subnets
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Name: !Sub '${AWS::StackName}-lb'
+      Subnets:
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: 301
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 80
+      Protocol: TCP
+      TargetType: ip
+      VpcId: !Ref VPC
+  TCPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancer
+      - TargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: TCP
+  TLSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    DependsOn:
+      - LoadBalancer
+      - TargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: TLS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+  ECSContainerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the ECS containers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: !FindInMap ['Subnets', 'PublicOne', 'CIDR']
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: !FindInMap ['Subnets', 'PublicTwo', 'CIDR']
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+
+  TaskCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-td'
+      RetentionInDays: 365
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-td'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: 'CORSRedirector'
+          Essential: true
+          MemoryReservation: 256
+          Cpu: 1024
+          Image:
+            Fn::Join:
+              - ':'
+              - - Fn::ImportValue: !Sub 'cors-redirector-ecr-${ECRStackName}'
+                - !Ref ImageTag
+          PortMappings:
+            - ContainerPort: 80
+          LinuxParameters:
+            InitProcessEnabled: true
+          Environment:
+            - Name: REDIRECT_TARGET
+              Value: !Ref Redirect
+            - Name: MAX_CONNECTIONS
+              Value: !Ref MaxConnections
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'TaskCloudWatchLogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'ecs'
+
+  ECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          # Note: We'd like TargetCapacity: 100 (spin up only as many instances as we need),
+          # but it seems to break autoscaling of the cluster's ASG - if all instances are 100% in use, ECS cannot
+          # create new tasks, which also breaks deployments.
+          # With a lower target, there's always space for some new task, which will cause utilization to go above it
+          # and scale up the cluster.
+          TargetCapacity: 90
+  ECSCapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref ECSCluster
+      CapacityProviders:
+        - !Ref ECSCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref ECSCapacityProvider
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - TCPListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-service'
+      Cluster: !Ref ECSCluster
+      LaunchType: EC2
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSContainerSG
+          Subnets:
+            - !Ref PrivateSubnetOne
+            - !Ref PrivateSubnetTwo
+      TaskDefinition: !Ref 'TaskDefinition'
+      LoadBalancers:
+        - ContainerName: CORSRedirector
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+
+  ################### Autoscaling #######################
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', ['service', !Ref ECSCluster, !GetAtt Service.Name]]
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  ScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-scale-out'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: -1
+            MetricIntervalUpperBound: 0
+            ScalingAdjustment: 1
+          - MetricIntervalLowerBound: -2
+            MetricIntervalUpperBound: -1
+            ScalingAdjustment: 2
+          - MetricIntervalUpperBound: -2
+            ScalingAdjustment: 3
+  ScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-scale-in'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        MetricAggregationType: Average
+        Cooldown: 600
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            MetricIntervalUpperBound: 1
+            ScalingAdjustment: -1
+          - MetricIntervalLowerBound: 1
+            MetricIntervalUpperBound: 2
+            ScalingAdjustment: -2
+          - MetricIntervalLowerBound: 2
+            ScalingAdjustment: -3
+  ScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scale-out'
+      AlarmDescription: !Sub '${AWS::StackName} ECS cluster is undersized'
+      AlarmActions:
+        - !Ref ScaleOutPolicy
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      Threshold: 0
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleContainers
+          Expression: !Sub '(e1 - e4) / ${ContainerTPS}'
+  ScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scale-in'
+      AlarmDescription: !Sub '${AWS::StackName} ECS cluster is oversized'
+      AlarmActions:
+        - !Ref ScaleInPolicy
+      EvaluationPeriods: 15
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleContainers
+          Expression: !Sub '(e1 - e4) / ${ContainerTPS}'
+
+  ################### Monitoring #######################
+
+  AlarmNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+      DisplayName: !Sub 'Notifications for alarms related to ${AWS::StackName}'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+  AlarmNotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlarmNotification
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "cloudwatch.amazonaws.com"
+            Action: SNS:Publish
+            Resource: !Ref AlarmNotification
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*'
+              StringEquals:
+                aws:SourceAccount: !Sub '${AWS::AccountId}'
+
+  HighLoadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-load'
+      AlarmDescription: !Sub '${AWS::StackName} Incoming requests are high compared to available capacity'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      EvaluationPeriods: 10
+      DatapointsToAlarm: 5
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 90
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LoadBalancerRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: True
+          Label: Load % (LB TPS / Available TPS capacity)
+          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+  TooManyLongLivedConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-long-con'
+      AlarmDescription: !Sub '${AWS::StackName} Too many long-lived connections'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      EvaluationPeriods: 10
+      DatapointsToAlarm: 5
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 5
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LoadBalancerRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: True
+          Label: Active connection load % (active connections / available TPS)
+          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+
+Outputs:
+  Cluster:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster'
+  Service:
+    Description: ECS service name
+    Value: !GetAtt Service.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-service'
+  LoadBalancer:
+    Description: Load balancer DNS name
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-lb'
