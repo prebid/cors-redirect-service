@@ -73,6 +73,19 @@ Mappings:
       CIDR: '172.54.32.0/20'
     PublicTwo:
       CIDR: '172.54.48.0/20'
+  AlarmThresholds:
+    Load:
+      Threshold: 90
+      N: 5
+      M: 10
+    Latency:
+      Threshold: 500
+      N: 5
+      M: 10
+    Error:
+      Threshold: 1
+      N: 5
+      M: 10
 
 Resources:
   ################## Network ##################
@@ -752,6 +765,29 @@ Resources:
                 aws:SourceArn: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*'
               StringEquals:
                 aws:SourceAccount: !Sub '${AWS::AccountId}'
+  LatencyMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterName: Latency
+      FilterPattern: '{$.Latency = *}'
+      LogGroupName: !Ref MetricsLogGroup
+      MetricTransformations:
+        - MetricValue: $.Latency
+          MetricName: Latency
+          Unit: Seconds
+          MetricNamespace: !Sub '${AWS::StackName}'
+  ErrorMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterName: Error
+      FilterPattern: '{$.StatusCode != 301}'
+      LogGroupName: !Ref MetricsLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricName: Error
+          Unit: Count
+          DefaultValue: 0
+          MetricNamespace: !Sub '${AWS::StackName}'
 
   HighLoadAlarm:
     Type: AWS::CloudWatch::Alarm
@@ -762,8 +798,8 @@ Resources:
         - !Ref AlarmNotification
       OKActions:
         - !Ref AlarmNotification
-      EvaluationPeriods: 10
-      DatapointsToAlarm: 5
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Load', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Load', 'M']
       ComparisonOperator: GreaterThanThreshold
       Threshold: 90
       Metrics:
@@ -797,50 +833,58 @@ Resources:
           ReturnData: True
           Label: Load % (LB TPS / Available TPS capacity)
           Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
-  TooManyLongLivedConnectionsAlarm:
+  HighLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub '${AWS::StackName}-long-con'
-      AlarmDescription: !Sub '${AWS::StackName} Too many long-lived connections'
+      AlarmName: !Sub '${AWS::StackName}-high-latency'
+      AlarmDescription: !Sub '${AWS::StackName} latency too high'
       AlarmActions:
         - !Ref AlarmNotification
       OKActions:
         - !Ref AlarmNotification
-      EvaluationPeriods: 10
-      DatapointsToAlarm: 5
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Latency', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Latency', 'M']
       ComparisonOperator: GreaterThanThreshold
-      Threshold: 5
+      Threshold: !FindInMap ['AlarmThresholds', 'Latency', 'Threshold']
       Metrics:
         - Id: m1
           ReturnData: False
-          Label: LoadBalancerActiveConns
+          Label: Latency (s)
           MetricStat:
             Period: 60
-            Stat: Average
+            Stat: p99
             Metric:
-              Namespace: AWS/NetworkELB
-              MetricName: ActiveFlowCount
-              Dimensions:
-                - Name: LoadBalancer
-                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
-        - Id: m2
-          ReturnData: False
-          Label: NumContainers
-          MetricStat:
-            Period: 60
-            Stat: Average
-            Metric:
-              Namespace: AWS/NetworkELB
-              MetricName: HealthyHostCount
-              Dimensions:
-                - Name: LoadBalancer
-                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
-                - Name: TargetGroup
-                  Value: !GetAtt TargetGroup.TargetGroupFullName
+              Namespace: !Sub '${AWS::StackName}'
+              MetricName: Latency
         - Id: e1
           ReturnData: True
-          Label: Active connection load % (active connections / available TPS)
-          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+          Label: Latency
+          Expression: m1 * 1000
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: !Sub '${AWS::StackName} is erroring out'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Error', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Error', 'M']
+      Threshold: !FindInMap ['AlarmThresholds', 'Error', 'Threshold']
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      Metrics:
+        - Id: m1
+          ReturnData: True
+          Label: Error
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: !Sub '${AWS::StackName}'
+              MetricName: Error
+
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
     Properties:
@@ -848,69 +892,150 @@ Resources:
       DashboardBody: !Sub
         - >
           {
-              "widgets": [
-                  {
-                      "height": 8,
-                      "width": 10,
-                      "y": 0,
-                      "x": 0,
-                      "type": "metric",
-                      "properties": {
-                          "metrics": [
-                              [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LoadBalancerRequestsPerMinute", "visible": false, "stat": "Sum" } ],
-                              [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
-                              [ { "id": "e1", "expression": "m1 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Load % (LB TPS / Available TPS capacity)", "visible": true, "region": "${AWS::Region}" } ],
-                              [ { "expression": "m3 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Active Conn % (LB Active conns / Available TPS capacity)", "id": "e2", "yAxis": "right", "region": "${AWS::Region}" } ],
-                              [ "AWS/NetworkELB", "ActiveFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m3", "visible": false, "label": "LoadBalancerActiveConns" } ]
-                          ],
-                          "region": "${AWS::Region}",
-                          "view": "timeSeries",
-                          "stacked": false,
-                          "period": 60,
-                          "annotations": {
-                              "horizontal": [
-                                  {
-                                      "label": "Load % > 90 for 5 datapoints in 10 minutes",
-                                      "value": 90
-                                  },
-                                  {
-                                      "label": "Active conn % > 5 for 5 datapoints in 10 minutes",
-                                      "value": 5,
-                                      "yAxis": "right"
-                                  }
-                              ]
-                          },
-                          "title": "Load",
-                          "stat": "Average"
+            "widgets": [
+              {
+                "height": 8,
+                "width": 10,
+                "y": 0,
+                "x": 0,
+                "type": "metric",
+                "properties": {
+                  "metrics": [
+                    [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LoadBalancerRequestsPerMinute", "visible": false, "stat": "Sum" } ],
+                    [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
+                    [ { "id": "e1", "expression": "m1 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Load % (LB TPS / Available TPS capacity)", "visible": true, "region": "${AWS::Region}" } ],
+                    [ { "expression": "m3 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Active Conn % (LB Active conns / Available TPS capacity)", "id": "e2", "yAxis": "right", "region": "${AWS::Region}" } ],
+                    [ "AWS/NetworkELB", "ActiveFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m3", "visible": false, "label": "LoadBalancerActiveConns" } ]
+                  ],
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 60,
+                  "annotations": {
+                    "horizontal": [
+                      {
+                        "label": "${LoadN} datapoints in ${LoadM} minutes",
+                        "value": ${LoadThreshold}
                       }
+                    ]
                   },
-                  {
-                      "type": "metric",
-                      "x": 10,
-                      "y": 0,
-                      "width": 10,
-                      "height": 8,
-                      "properties": {
-                          "metrics": [
-                              [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LBReqPerMinute", "visible": false, "stat": "Sum" } ],
-                              [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
-                              [ { "id": "e1", "label": "Requests per second", "expression": "m1 / 60", "visible": true } ],
-                              [ { "expression": "m2 * ${ContainerTPS}", "label": "Capacity", "id": "e2" } ]
-                          ],
-                          "region": "${AWS::Region}",
-                          "view": "timeSeries",
-                          "stacked": false,
-                          "start": "-PT3H",
-                          "end": "P0D",
-                          "period": 60,
-                          "title": "Requests per second",
-                          "stat": "Average"
-                      }
+                  "title": "Load",
+                  "stat": "Average",
+                  "yAxis": {
+                    "left": {
+                      "showUnits": false,
+                      "label": "%"
+                    }
                   }
-              ]
+                }
+              },
+              {
+                "height": 8,
+                "width": 10,
+                "y": 0,
+                "x": 10,
+                "type": "metric",
+                "properties": {
+                  "metrics": [
+                    [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LBReqPerMinute", "visible": false, "stat": "Sum" } ],
+                    [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
+                    [ { "id": "e1", "label": "TPS (at load balancer)", "expression": "m1 / 60", "visible": true, "region": "${AWS::Region}" } ],
+                    [ { "expression": "m3 / 60", "label": "TPS (at service)", "id": "e3", "region": "${AWS::Region}" } ],
+                    [ { "expression": "m2 * ${ContainerTPS}", "label": "Capacity", "id": "e2", "region": "${AWS::Region}" } ],
+                    [ "${AWS::StackName}", "Latency", { "id": "m3", "visible": false, "stat": "SampleCount", "label": "ECSReqPerMinute" } ]
+                  ],
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 60,
+                  "title": "Traffic",
+                  "stat": "Average",
+                  "yAxis": {
+                    "left": {
+                      "showUnits": false,
+                      "label": "Requests/second"
+                    }
+                  }
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 8,
+                "width": 10,
+                "height": 8,
+                "properties": {
+                  "metrics": [
+                    [ { "expression": "m1 * 1000", "label": "Latency (p99)", "id": "e1", "region": "${AWS::Region}" } ],
+                    [ "${AWS::StackName}", "Latency", { "id": "m1", "visible": false } ]
+                  ],
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "stat": "p99",
+                  "period": 60,
+                  "title": "Latency",
+                  "yAxis": {
+                    "left": {
+                      "label": "Milliseconds",
+                      "showUnits": false
+                    }
+                  },
+                  "annotations": {
+                    "horizontal": [
+                      {
+                        "label": "${LatencyN} datapoints in ${LatencyM} minutes",
+                        "value": ${LatencyThreshold}
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "type": "metric",
+                "x": 10,
+                "y": 8,
+                "width": 10,
+                "height": 8,
+                "properties": {
+                  "metrics": [
+                    [ "${AWS::StackName}", "Error" ]
+                  ],
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "stat": "Sum",
+                  "period": 60,
+                  "title": "Errors",
+                  "yAxis": {
+                    "left": {
+                      "label": "Count",
+                      "showUnits": false
+                    }
+                  },
+                  "annotations": {
+                    "horizontal": [
+                      {
+                        "label": "${ErrorN} datapoints in ${ErrorM} minutes",
+                        "value": ${ErrorThreshold}
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
           }
         - LoadBalancer: !GetAtt LoadBalancer.LoadBalancerFullName
           TargetGroup: !GetAtt TargetGroup.TargetGroupFullName
+          LoadThreshold: !FindInMap ['AlarmThresholds', 'Load', 'Threshold']
+          LoadN: !FindInMap ['AlarmThresholds', 'Load', 'N']
+          LoadM: !FindInMap ['AlarmThresholds', 'Load', 'M']
+          LatencyThreshold: !FindInMap ['AlarmThresholds', 'Latency', 'Threshold']
+          LatencyN: !FindInMap ['AlarmThresholds', 'Latency', 'N']
+          LatencyM: !FindInMap ['AlarmThresholds', 'Latency', 'M']
+          ErrorThreshold: !FindInMap ['AlarmThresholds', 'Error', 'Threshold']
+          ErrorN: !FindInMap ['AlarmThresholds', 'Error', 'N']
+          ErrorM: !FindInMap ['AlarmThresholds', 'Error', 'M']
 
 Outputs:
   Cluster:
