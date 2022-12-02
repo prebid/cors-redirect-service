@@ -274,6 +274,14 @@ Resources:
             Principal:
               Service: "ecs-tasks.amazonaws.com"
             Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AllowSSM
+          PolicyDocument:
+            Statement:
+              - Effect: "Allow"
+                Sid: ""
+                Action: "ssm:GetParameters"
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${CWAgentConfig}'
       ManagedPolicyArns:
         - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 
@@ -393,19 +401,76 @@ Resources:
   TaskCloudWatchLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub '/ecs/${AWS::StackName}-td'
-      RetentionInDays: 365
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-task'
+      RetentionInDays: 30
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-access-log'
+      RetentionInDays: 30
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-error-log'
+      RetentionInDays: 30
+  MetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-metrics-log'
+      RetentionInDays: 30
 
+  CWAgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: ecs-cwagent-sidecar-ec2
+      Type: String
+      Value: !Sub >
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "run_as_user": "root"
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/nginx-logs/access.log",
+                    "log_group_name": "${AccessLogGroup}",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/nginx-logs/error.log",
+                    "log_group_name": "${ErrorLogGroup}",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/nginx-logs/metrics.log",
+                    "log_group_name": "${MetricsLogGroup}",
+                    "log_stream_name": "{instance_id}"
+                  }
+                ]
+              }
+            }
+          }
+        }
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - CWAgentConfig
     Properties:
       Family: !Sub '${AWS::StackName}-td'
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - EC2
       ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Volumes:
+        - Name: logs
+          DockerVolumeConfiguration:
+            Driver: local
+            Scope: task
       ContainerDefinitions:
-        - Name: 'CORSRedirector'
+        - Name: CORSRedirector
           Essential: true
           MemoryReservation: 256
           Cpu: 1024
@@ -423,6 +488,24 @@ Resources:
               Value: !Ref Redirect
             - Name: MAX_CONNECTIONS
               Value: !Ref MaxConnections
+          MountPoints:
+            - ContainerPath: /var/nginx-logs
+              SourceVolume: logs
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'TaskCloudWatchLogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'ecs'
+        - Name: cloudwatch-agent
+          MemoryReservation: 256
+          Image: amazon/cloudwatch-agent:latest
+          Secrets:
+            - Name: CW_CONFIG_CONTENT
+              ValueFrom: ecs-cwagent-sidecar-ec2
+          VolumesFrom:
+            - SourceContainer: CORSRedirector
+              ReadOnly: true
           LogConfiguration:
             LogDriver: awslogs
             Options:

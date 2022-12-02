@@ -16,7 +16,7 @@ user  nginx;
 worker_processes  1;
 worker_rlimit_nofile ${MAX_CONNECTIONS};
 
-error_log  /var/log/nginx/error.log warn;
+error_log  /var/nginx-logs/error.log warn;
 pid        /var/run/nginx.pid;
 
 
@@ -32,7 +32,10 @@ http {
                       '\$status \$body_bytes_sent "\$http_referer" '
                       '"\$http_user_agent" "\$http_x_forwarded_for"';
 
-    access_log  /var/log/nginx/access.log  main;
+    log_format metrics '{"Latency": \$request_time , "StatusCode": \$status }';
+
+    access_log  /var/nginx-logs/access.log  main;
+    access_log  /var/nginx-logs/metrics.log metrics;
 
     sendfile        on;
     #tcp_nopush     on;
