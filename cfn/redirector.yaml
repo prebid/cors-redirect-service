@@ -833,6 +833,50 @@ Resources:
           ReturnData: True
           Label: Load % (LB TPS / Available TPS capacity)
           Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+  LowLoadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-low-load'
+      AlarmDescription: !Sub '${AWS::StackName} is consistently oversized'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      DatapointsToAlarm: 24
+      EvaluationPeriods: 24
+      ComparisonOperator: LessThanThreshold
+      Threshold: 50
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LoadBalancerRequestsPerHour
+          MetricStat:
+            Period: 3600
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 3600
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: True
+          Label: Load % (LB TPS / Available TPS capacity)
+          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 3600) * 100'
   HighLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
