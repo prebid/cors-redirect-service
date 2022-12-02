@@ -13,7 +13,7 @@ if [ -z "$AWS" ]; then
 fi
 
 if [ -z "$TAG" ]; then
-  TAG="test"
+  TAG="latest"
 fi
 
 if [ -z "$ECR_REPOSITORY" ]; then

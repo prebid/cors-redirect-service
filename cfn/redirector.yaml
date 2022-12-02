@@ -10,7 +10,7 @@ Parameters:
     Description: Name of the CFN stack created through the `ecr.yaml` template
   ImageTag:
     Type: String
-    Default: test
+    Default: latest
     Description: Docker image tag to use.
   InstanceType:
     Description: EC2 instance type

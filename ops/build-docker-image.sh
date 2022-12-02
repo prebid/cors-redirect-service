@@ -9,7 +9,7 @@ NAME="$1"
 TAG="$2"
 
 if [ -z "$TAG" ]; then
-  TAG="test"
+  TAG="latest"
 fi
 
 set -x
