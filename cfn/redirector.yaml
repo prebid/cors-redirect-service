@@ -256,7 +256,7 @@ Resources:
   EcsInstanceRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::StackName}-ecsInstanceRole'
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-ecsInstanceRole'
       Description: ECS instance role
       AssumeRolePolicyDocument:
         Version: "2008-10-17"
@@ -271,13 +271,13 @@ Resources:
   EcsInstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
-      InstanceProfileName: !Sub '${AWS::StackName}-ecsInstanceProfile'
+      InstanceProfileName: !Sub '${AWS::StackName}-${AWS::Region}-ecsInstanceProfile'
       Roles:
         - !Ref EcsInstanceRole
   TaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      RoleName: !Sub '${AWS::StackName}-ecsTaskExecRole'
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-ecsTaskExecRole'
       Description: ECS instance role
       AssumeRolePolicyDocument:
         Version: "2008-10-17"
