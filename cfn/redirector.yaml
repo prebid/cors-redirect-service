@@ -45,6 +45,10 @@ Parameters:
     Type: Number
     Default: 2000
     Description: How many requests per second a container can serve.
+  ContainersPerInstance:
+    Type: Number
+    Default: 2
+    Description: How many containers to run per instance. Should be the number of vCPUs available for the selected instance type.
   MinTPSCapacity:
     Type: Number
     Default: 4000
@@ -368,6 +372,11 @@ Resources:
       Protocol: TCP
       TargetType: ip
       VpcId: !Ref VPC
+      TargetGroupAttributes:
+          # Set a low interval for leaving targets in DRAINING - our requests should be very fast to serve.
+          # We don't want to leave them in the LB for too long because they still count as healthy hosts for autoscaling.
+        - Key: deregistration_delay.timeout_seconds
+          Value: 10
   TCPListener:
     Type: AWS::ElasticLoadBalancingV2::Listener
     DependsOn:
@@ -532,13 +541,8 @@ Resources:
       AutoScalingGroupProvider:
         AutoScalingGroupArn: !Ref AutoScalingGroup
         ManagedScaling:
-          Status: ENABLED
-          # Note: We'd like TargetCapacity: 100 (spin up only as many instances as we need),
-          # but it seems to break autoscaling of the cluster's ASG - if all instances are 100% in use, ECS cannot
-          # create new tasks, which also breaks deployments.
-          # With a lower target, there's always space for some new task, which will cause utilization to go above it
-          # and scale up the cluster.
-          TargetCapacity: 90
+          # managed autoscaling does not seem to work correctly, does not want to scale in - we manage autoscaling ourselves
+          Status: DISABLED
   ECSCapacityProviderAssociation:
     Type: AWS::ECS::ClusterCapacityProviderAssociations
     Properties:
@@ -577,6 +581,7 @@ Resources:
           Field: instanceId
 
   ################### Autoscaling #######################
+
   AutoScalingTarget:
     Type: AWS::ApplicationAutoScaling::ScalableTarget
     Properties:
@@ -586,10 +591,10 @@ Resources:
       RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
       ScalableDimension: ecs:service:DesiredCount
       ServiceNamespace: ecs
-  ScaleOutPolicy:
+  ECSScaleOutPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub '${AWS::StackName}-scale-out'
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-out'
       PolicyType: StepScaling
       ScalingTargetId: !Ref AutoScalingTarget
       StepScalingPolicyConfiguration:
@@ -604,10 +609,10 @@ Resources:
             ScalingAdjustment: 2
           - MetricIntervalUpperBound: -2
             ScalingAdjustment: 3
-  ScaleInPolicy:
+  ECSScaleInPolicy:
     Type: AWS::ApplicationAutoScaling::ScalingPolicy
     Properties:
-      PolicyName: !Sub '${AWS::StackName}-scale-in'
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-in'
       PolicyType: StepScaling
       ScalingTargetId: !Ref AutoScalingTarget
       StepScalingPolicyConfiguration:
@@ -623,13 +628,13 @@ Resources:
             ScalingAdjustment: -2
           - MetricIntervalLowerBound: 2
             ScalingAdjustment: -3
-  ScaleOutAlarm:
+  ECSScaleOutAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub '${AWS::StackName}-scale-out'
+      AlarmName: !Sub '${AWS::StackName}-ecs-scale-out'
       AlarmDescription: !Sub '${AWS::StackName} ECS cluster is undersized'
       AlarmActions:
-        - !Ref ScaleOutPolicy
+        - !Ref ECSScaleOutPolicy
       EvaluationPeriods: 1
       ComparisonOperator: LessThanThreshold
       Threshold: 0
@@ -679,14 +684,14 @@ Resources:
         - Id: e5
           ReturnData: True
           Label: IdleContainers
-          Expression: !Sub '(e1 - e4) / ${ContainerTPS}'
-  ScaleInAlarm:
+          Expression: !Sub 'IF(e4, (e1 - e4) / ${ContainerTPS})'
+  ECSScaleInAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub '${AWS::StackName}-scale-in'
+      AlarmName: !Sub '${AWS::StackName}-ecs-scale-in'
       AlarmDescription: !Sub '${AWS::StackName} ECS cluster is oversized'
       AlarmActions:
-        - !Ref ScaleInPolicy
+        - !Ref ECSScaleInPolicy
       EvaluationPeriods: 15
       ComparisonOperator: GreaterThanThreshold
       Threshold: 1
@@ -736,7 +741,150 @@ Resources:
         - Id: e5
           ReturnData: True
           Label: IdleContainers
-          Expression: !Sub '(e1 - e4) / ${ContainerTPS}'
+          Expression: !Sub 'IF(e4, (e1 - e4) / ${ContainerTPS})'
+
+  EC2ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ec2-scale-out'
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      StepAdjustments:
+        - MetricIntervalLowerBound: -1
+          MetricIntervalUpperBound: 0
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: -2
+          MetricIntervalUpperBound: -1
+          ScalingAdjustment: 2
+        - MetricIntervalUpperBound: -2
+          ScalingAdjustment: 3
+  EC2ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ec2-scale-in'
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: 1
+          ScalingAdjustment: -1
+        - MetricIntervalLowerBound: 1
+          MetricIntervalUpperBound: 2
+          ScalingAdjustment: -2
+        - MetricIntervalLowerBound: 2
+          ScalingAdjustment: -3
+  EC2ScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-scale-out'
+      AlarmDescription: !Sub '${AWS::StackName} EC2 ASG is undersized'
+      AlarmActions:
+        - !Ref EC2ScaleOutPolicy
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      Threshold: 0
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumInstances
+          MetricStat:
+            Period: 60
+            Stat: SampleCount
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: StatusCheckFailed
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref AutoScalingGroup
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS} * ${ContainersPerInstance}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleInstances
+          Expression: !Sub 'IF(e4, (e1 - e4) / (${ContainerTPS} * ${ContainersPerInstance}))'
+  EC2ScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-scale-in'
+      AlarmDescription: !Sub '${AWS::StackName} EC2 ASG is oversized'
+      AlarmActions:
+        - !Ref EC2ScaleInPolicy
+      EvaluationPeriods: 15
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumInstances
+          MetricStat:
+            Period: 60
+            Stat: SampleCount
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: StatusCheckFailed
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref AutoScalingGroup
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS} * ${ContainersPerInstance}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleInstances
+          Expression: !Sub 'IF(e4, (e1 - e4) / (${ContainerTPS} * ${ContainersPerInstance}))'
 
   ################### Monitoring #######################
 
@@ -842,16 +990,16 @@ Resources:
         - !Ref AlarmNotification
       OKActions:
         - !Ref AlarmNotification
-      DatapointsToAlarm: 24
-      EvaluationPeriods: 24
+      DatapointsToAlarm: 1440
+      EvaluationPeriods: 1440
       ComparisonOperator: LessThanThreshold
       Threshold: 50
       Metrics:
         - Id: m1
           ReturnData: False
-          Label: LoadBalancerRequestsPerHour
+          Label: LoadBalancerRequestsPerMinute
           MetricStat:
-            Period: 3600
+            Period: 60
             Stat: Average
             Metric:
               Namespace: AWS/NetworkELB
@@ -863,7 +1011,7 @@ Resources:
           ReturnData: False
           Label: NumContainers
           MetricStat:
-            Period: 3600
+            Period: 60
             Stat: Average
             Metric:
               Namespace: AWS/NetworkELB
@@ -876,7 +1024,7 @@ Resources:
         - Id: e1
           ReturnData: True
           Label: Load % (LB TPS / Available TPS capacity)
-          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 3600) * 100'
+          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
   HighLatencyAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
@@ -969,7 +1117,11 @@ Resources:
                     "left": {
                       "showUnits": false,
                       "label": "%"
-                    }
+                    },
+                    "right": {
+                      "showUnits": false,
+                      "label": "%"
+                    }          
                   }
                 }
               },
