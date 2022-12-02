@@ -730,13 +730,13 @@ Resources:
       Metrics:
         - Id: m1
           ReturnData: False
-          Label: LoadBalancerRequestsPerMinute
+          Label: LoadBalancerActiveConns
           MetricStat:
             Period: 60
             Stat: Average
             Metric:
               Namespace: AWS/NetworkELB
-              MetricName: NewFlowCount
+              MetricName: ActiveFlowCount
               Dimensions:
                 - Name: LoadBalancer
                   Value: !GetAtt LoadBalancer.LoadBalancerFullName
