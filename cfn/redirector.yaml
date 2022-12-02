@@ -543,7 +543,7 @@ Resources:
           Label: LBRequestsPerMinute
           MetricStat:
             Period: 60
-            Stat: Average
+            Stat: Sum
             Metric:
               Namespace: AWS/NetworkELB
               MetricName: NewFlowCount
@@ -600,7 +600,7 @@ Resources:
           Label: LBRequestsPerMinute
           MetricStat:
             Period: 60
-            Stat: Average
+            Stat: Sum
             Metric:
               Namespace: AWS/NetworkELB
               MetricName: NewFlowCount
@@ -758,6 +758,76 @@ Resources:
           ReturnData: True
           Label: Active connection load % (active connections / available TPS)
           Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}'
+      DashboardBody: !Sub
+        - >
+          {
+              "widgets": [
+                  {
+                      "height": 8,
+                      "width": 10,
+                      "y": 0,
+                      "x": 0,
+                      "type": "metric",
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LoadBalancerRequestsPerMinute", "visible": false, "stat": "Sum" } ],
+                              [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
+                              [ { "id": "e1", "expression": "m1 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Load % (LB TPS / Available TPS capacity)", "visible": true, "region": "${AWS::Region}" } ],
+                              [ { "expression": "m3 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Active Conn % (LB Active conns / Available TPS capacity)", "id": "e2", "yAxis": "right", "region": "${AWS::Region}" } ],
+                              [ "AWS/NetworkELB", "ActiveFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m3", "visible": false, "label": "LoadBalancerActiveConns" } ]
+                          ],
+                          "region": "${AWS::Region}",
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "period": 60,
+                          "annotations": {
+                              "horizontal": [
+                                  {
+                                      "label": "Load % > 90 for 5 datapoints in 10 minutes",
+                                      "value": 90
+                                  },
+                                  {
+                                      "label": "Active conn % > 5 for 5 datapoints in 10 minutes",
+                                      "value": 5,
+                                      "yAxis": "right"
+                                  }
+                              ]
+                          },
+                          "title": "Load",
+                          "stat": "Average"
+                      }
+                  },
+                  {
+                      "type": "metric",
+                      "x": 10,
+                      "y": 0,
+                      "width": 10,
+                      "height": 8,
+                      "properties": {
+                          "metrics": [
+                              [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LBReqPerMinute", "visible": false, "stat": "Sum" } ],
+                              [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
+                              [ { "id": "e1", "label": "Requests per second", "expression": "m1 / 60", "visible": true } ],
+                              [ { "expression": "m2 * ${ContainerTPS}", "label": "Capacity", "id": "e2" } ]
+                          ],
+                          "region": "${AWS::Region}",
+                          "view": "timeSeries",
+                          "stacked": false,
+                          "start": "-PT3H",
+                          "end": "P0D",
+                          "period": 60,
+                          "title": "Requests per second",
+                          "stat": "Average"
+                      }
+                  }
+              ]
+          }
+        - LoadBalancer: !GetAtt LoadBalancer.LoadBalancerFullName
+          TargetGroup: !GetAtt TargetGroup.TargetGroupFullName
 
 Outputs:
   Cluster:
