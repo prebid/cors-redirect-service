@@ -928,7 +928,7 @@ Resources:
     Type: AWS::Logs::MetricFilter
     Properties:
       FilterName: Error
-      FilterPattern: '{$.StatusCode != 301}'
+      FilterPattern: '{$.StatusCode != 301 && ($.StatusCode < 400 || $.StatusCode >= 500)}'
       LogGroupName: !Ref MetricsLogGroup
       MetricTransformations:
         - MetricValue: 1
