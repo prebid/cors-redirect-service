@@ -1084,6 +1084,7 @@ Resources:
       DashboardBody: !Sub
         - >
           {
+            "periodOverride": "inherit",
             "widgets": [
               {
                 "height": 8,
