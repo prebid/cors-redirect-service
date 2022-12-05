@@ -86,7 +86,7 @@ Mappings:
       Threshold: 500
       N: 5
       M: 10
-    Error:
+    Fault:
       Threshold: 1
       N: 5
       M: 10
@@ -924,11 +924,23 @@ Resources:
           MetricName: Latency
           Unit: Seconds
           MetricNamespace: !Sub '${AWS::StackName}'
+  FaultMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterName: Fault
+      FilterPattern: '{$.StatusCode != 301 && ($.StatusCode < 400 || $.StatusCode >= 500)}'
+      LogGroupName: !Ref MetricsLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricName: Fault
+          Unit: Count
+          DefaultValue: 0
+          MetricNamespace: !Sub '${AWS::StackName}'
   ErrorMetric:
     Type: AWS::Logs::MetricFilter
     Properties:
       FilterName: Error
-      FilterPattern: '{$.StatusCode != 301 && ($.StatusCode < 400 || $.StatusCode >= 500)}'
+      FilterPattern: '{$.StatusCode >= 400 && $.StatusCode < 500}'
       LogGroupName: !Ref MetricsLogGroup
       MetricTransformations:
         - MetricValue: 1
@@ -1052,30 +1064,30 @@ Resources:
           ReturnData: True
           Label: Latency
           Expression: m1 * 1000
-  ErrorAlarm:
+  FaultAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:
-      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmName: !Sub '${AWS::StackName}-faults'
       AlarmDescription: !Sub '${AWS::StackName} is erroring out'
       AlarmActions:
         - !Ref AlarmNotification
       OKActions:
         - !Ref AlarmNotification
-      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Error', 'N']
-      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Error', 'M']
-      Threshold: !FindInMap ['AlarmThresholds', 'Error', 'Threshold']
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Fault', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Fault', 'M']
+      Threshold: !FindInMap ['AlarmThresholds', 'Fault', 'Threshold']
       ComparisonOperator: GreaterThanOrEqualToThreshold
       TreatMissingData: breaching
       Metrics:
         - Id: m1
           ReturnData: True
-          Label: Error
+          Label: Fault
           MetricStat:
             Period: 60
             Stat: Sum
             Metric:
               Namespace: !Sub '${AWS::StackName}'
-              MetricName: Error
+              MetricName: Fault
 
   Dashboard:
     Type: AWS::CloudWatch::Dashboard
@@ -1196,7 +1208,8 @@ Resources:
                 "height": 8,
                 "properties": {
                   "metrics": [
-                    [ "${AWS::StackName}", "Error" ]
+                    [ "${AWS::StackName}", "Fault" , {"label": "Fault (not 301, not 4xx)"}],
+                    [ "${AWS::StackName}", "Error" , {"label": "Error (4xx)", "yAxis": "right"}]
                   ],
                   "view": "timeSeries",
                   "stacked": false,
@@ -1208,13 +1221,17 @@ Resources:
                     "left": {
                       "label": "Count",
                       "showUnits": false
+                    },
+                    "right": {
+                      "label": "Count",
+                      "showUnits": false
                     }
                   },
                   "annotations": {
                     "horizontal": [
                       {
-                        "label": "${ErrorN} datapoints in ${ErrorM} minutes",
-                        "value": ${ErrorThreshold}
+                        "label": "${FaultN} datapoints in ${FaultM} minutes",
+                        "value": ${FaultThreshold}
                       }
                     ]
                   }
@@ -1230,9 +1247,9 @@ Resources:
           LatencyThreshold: !FindInMap ['AlarmThresholds', 'Latency', 'Threshold']
           LatencyN: !FindInMap ['AlarmThresholds', 'Latency', 'N']
           LatencyM: !FindInMap ['AlarmThresholds', 'Latency', 'M']
-          ErrorThreshold: !FindInMap ['AlarmThresholds', 'Error', 'Threshold']
-          ErrorN: !FindInMap ['AlarmThresholds', 'Error', 'N']
-          ErrorM: !FindInMap ['AlarmThresholds', 'Error', 'M']
+          FaultThreshold: !FindInMap ['AlarmThresholds', 'Fault', 'Threshold']
+          FaultN: !FindInMap ['AlarmThresholds', 'Fault', 'N']
+          FaultM: !FindInMap ['AlarmThresholds', 'Fault', 'M']
 
 Outputs:
   Cluster:
