@@ -1108,8 +1108,8 @@ Resources:
                   "metrics": [
                     [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LoadBalancerRequestsPerMinute", "visible": false, "stat": "Sum" } ],
                     [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
-                    [ { "id": "e1", "expression": "m1 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Load % (LB TPS / Available TPS capacity)", "visible": true, "region": "${AWS::Region}" } ],
-                    [ { "expression": "m3 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Active Conn % (LB Active conns / Available TPS capacity)", "id": "e2", "yAxis": "right", "region": "${AWS::Region}" } ],
+                    [ { "id": "e1", "expression": "m1 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Load % (LB TPS / Available TPS capacity)", "visible": true, "region": "${AWS::Region}", "color": "#FF5D64" } ],
+                    [ { "expression": "m3 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Active Conn % (LB Active conns / Available TPS capacity)", "id": "e2", "yAxis": "right", "region": "${AWS::Region}", "color": "#3A92CF" } ],
                     [ "AWS/NetworkELB", "ActiveFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m3", "visible": false, "label": "LoadBalancerActiveConns" } ]
                   ],
                   "region": "${AWS::Region}",
@@ -1175,7 +1175,7 @@ Resources:
                 "height": 8,
                 "properties": {
                   "metrics": [
-                    [ { "expression": "m1 * 1000", "label": "Latency (p99)", "id": "e1", "region": "${AWS::Region}" } ],
+                    [ { "expression": "m1 * 1000", "label": "Latency (p99)", "id": "e1", "region": "${AWS::Region}", "color": "#FF5D64" } ],
                     [ "${AWS::StackName}", "Latency", { "id": "m1", "visible": false } ]
                   ],
                   "view": "timeSeries",
@@ -1208,8 +1208,8 @@ Resources:
                 "height": 8,
                 "properties": {
                   "metrics": [
-                    [ "${AWS::StackName}", "Fault" , {"label": "Fault (not 301, not 4xx)"}],
-                    [ "${AWS::StackName}", "Error" , {"label": "Error (4xx)", "yAxis": "right"}]
+                    [ "${AWS::StackName}", "Fault" , {"label": "Fault (not 301, not 4xx)", "color": "#FF5D64"}],
+                    [ "${AWS::StackName}", "Error" , {"label": "Error (4xx)", "yAxis": "right", "color": "#3A92CF"}]
                   ],
                   "view": "timeSeries",
                   "stacked": false,
