@@ -444,7 +444,7 @@ Resources:
   CWAgentConfig:
     Type: AWS::SSM::Parameter
     Properties:
-      Name: ecs-cwagent-sidecar-ec2
+      Name: !Sub '${AWS::StackName}-cw-config'
       Type: String
       Value: !Sub >
         {
@@ -524,7 +524,7 @@ Resources:
           Image: amazon/cloudwatch-agent:latest
           Secrets:
             - Name: CW_CONFIG_CONTENT
-              ValueFrom: ecs-cwagent-sidecar-ec2
+              ValueFrom: !Ref CWAgentConfig
           VolumesFrom:
             - SourceContainer: CORSRedirector
               ReadOnly: true
