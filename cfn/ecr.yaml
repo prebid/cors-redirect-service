@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CORS redirect service ECR repository; see see https://github.com/prebid/cors-redirect-service
+Parameters:
+  RepositoryName:
+    Type: String
+    MinLength: 1
+    Description: ECS repository name
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+Outputs:
+  URL:
+    Description: ECR respository URL
+    Value: !GetAtt Repository.RepositoryUri
+    Export:
+      Name: !Join ['-', ['cors-redirector-ecr', !Ref 'AWS::StackName']]

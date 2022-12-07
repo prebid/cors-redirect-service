@@ -1,0 +1,1269 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CORS redirect service; see https://github.com/prebid/cors-redirect-service
+Parameters:
+  CertificateArn:
+    Type: String
+    Description: TLS certificate ARN
+  ECRStackName:
+    Type: String
+    MinLength: 1
+    Description: Name of the CFN stack created through the `ecr.yaml` template
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Docker image tag to use.
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: c6i.large
+  Redirect:
+    Type: String
+    MinLength: 1
+    Default: 'https://cdn.jsdelivr.net/gh/prebid/currency-file@1/latest.json'
+    Description: URL to redirect to
+  MinInstances:
+    Type: Number
+    Default: 2
+    Description: Minimum number of instances
+  MaxInstances:
+    Type: Number
+    Default: 10
+    Description: Maximum number of instances
+  MinContainers:
+    Type: Number
+    Default: 2
+    Description: Minimum number of containers
+  MaxContainers:
+    Type: Number
+    Default: 20
+    Description: Maximum number of containers
+  MaxConnections:
+    Type: Number
+    Default: 1024
+    Description: Maximum number of connections per container
+  ContainerTPS:
+    Type: Number
+    Default: 2000
+    Description: How many requests per second a container can serve.
+  ContainersPerInstance:
+    Type: Number
+    Default: 2
+    Description: How many containers to run per instance. Should be the number of vCPUs available for the selected instance type.
+  MinTPSCapacity:
+    Type: Number
+    Default: 4000
+    Description: How many TPS the service should be able to handle at all times.
+  TargetSpareTPSCapacity:
+    Type: Number
+    Default: 1000
+    Description: Target spare capacity (in TPS). The cluster will autoscale attempting to maintain the ability to handle a surge of this many TPS.
+  NotificationEmail:
+    Type: String
+    Default: alerts@prebid.org
+    Description: Email to notify on alarms
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+
+Mappings:
+  Subnets:
+    VPC:
+      CIDR: '172.54.0.0/16'
+    PrivateOne:
+      CIDR: '172.54.0.0/20'
+    PrivateTwo:
+      CIDR: '172.54.16.0/20'
+    PublicOne:
+      CIDR: '172.54.32.0/20'
+    PublicTwo:
+      CIDR: '172.54.48.0/20'
+  AlarmThresholds:
+    Load:
+      Threshold: 90
+      N: 5
+      M: 10
+    Latency:
+      Threshold: 500
+      N: 5
+      M: 10
+    Fault:
+      Threshold: 1
+      N: 5
+      M: 10
+
+Resources:
+  ################## Network ##################
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: false
+      CidrBlock: !FindInMap ['Subnets', 'VPC', 'CIDR']
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-vpc'
+  PrivateSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PrivateOne', 'CIDR']
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-subnet-az1'
+  PrivateSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PrivateTwo', 'CIDR']
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-subnet-az2'
+  PublicSubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PublicOne', 'CIDR']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-public-subnet-az1'
+  PublicSubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref VPC
+      CidrBlock: !FindInMap ['Subnets', 'PublicTwo', 'CIDR']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-public-subnet-az2'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-igw'
+  InternetGatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-public-routing-table'
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachement
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+
+  NATGatewayOne:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNATOne.AllocationId
+      SubnetId: !Ref PublicSubnetOne
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-nat-gw-az1'
+  NATGatewayTwo:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPNATTwo.AllocationId
+      SubnetId: !Ref PublicSubnetTwo
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-nat-gw-az2'
+  EIPNATOne:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachement
+    Properties:
+      Domain: vpc
+  EIPNATTwo:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachement
+    Properties:
+      Domain: vpc
+
+  PrivateRouteTableOne:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-routing-table-az1'
+  PrivateRouteOne:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGatewayOne
+  PrivateRouteTableOneAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableOne
+      SubnetId: !Ref PrivateSubnetOne
+  PrivateRouteTableTwo:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: 'Name'
+          Value: !Sub '${AWS::StackName}-private-routing-table-az2'
+  PrivateRouteTwo:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGatewayTwo
+  PrivateRouteTableTwoAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableTwo
+      SubnetId: !Ref PrivateSubnetTwo
+
+
+  ##################### IAM  #########################
+
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-ecsInstanceRole'
+      Description: ECS instance role
+      AssumeRolePolicyDocument:
+        Version: "2008-10-17"
+        Statement:
+          - Effect: "Allow"
+            Sid: ""
+            Principal:
+              Service: "ec2.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+  EcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub '${AWS::StackName}-${AWS::Region}-ecsInstanceProfile'
+      Roles:
+        - !Ref EcsInstanceRole
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-${AWS::Region}-ecsTaskExecRole'
+      Description: ECS instance role
+      AssumeRolePolicyDocument:
+        Version: "2008-10-17"
+        Statement:
+          - Effect: "Allow"
+            Sid: ""
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: AllowSSM
+          PolicyDocument:
+            Statement:
+              - Effect: "Allow"
+                Sid: ""
+                Action: "ssm:GetParameters"
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${CWAgentConfig}'
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  ##################### Service ######################
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-ecs-cluster'
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id}}'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref EcsInstanceProfile
+        SecurityGroupIds:
+          - !Ref InstanceSecurityGroup
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              # Set any ECS agent configuration options
+              echo ECS_CLUSTER=${ECSCluster} >> /etc/ecs/ecs.config
+            - ECSCluster: !Ref ECSCluster
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnetOne
+        - !Ref PrivateSubnetTwo
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to instances of auto-scaling group
+      VpcId:
+        !Ref VPC
+      SecurityGroupIngress:
+        # Allow SSH - but note that these instances are not facing the Internet; if needed, spin up an entry instance
+        # in one of the public subnets
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: network
+      Scheme: internet-facing
+      Name: !Sub '${AWS::StackName}-lb'
+      Subnets:
+        - !Ref PublicSubnetOne
+        - !Ref PublicSubnetTwo
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: 301
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 80
+      Protocol: TCP
+      TargetType: ip
+      VpcId: !Ref VPC
+      TargetGroupAttributes:
+          # Set a low interval for leaving targets in DRAINING - our requests should be very fast to serve.
+          # We don't want to leave them in the LB for too long because they still count as healthy hosts for autoscaling.
+        - Key: deregistration_delay.timeout_seconds
+          Value: 10
+  TCPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - LoadBalancer
+      - TargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: TCP
+  TLSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    DependsOn:
+      - LoadBalancer
+      - TargetGroup
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: TLS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+  ECSContainerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the ECS containers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: !FindInMap ['Subnets', 'PublicOne', 'CIDR']
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: !FindInMap ['Subnets', 'PublicTwo', 'CIDR']
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+
+  TaskCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-task'
+      RetentionInDays: 30
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-access-log'
+      RetentionInDays: 30
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-error-log'
+      RetentionInDays: 30
+  MetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${AWS::StackName}-metrics-log'
+      RetentionInDays: 30
+
+  CWAgentConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${AWS::StackName}-cw-config'
+      Type: String
+      Value: !Sub >
+        {
+          "agent": {
+            "metrics_collection_interval": 60,
+            "run_as_user": "root"
+          },
+          "logs": {
+            "logs_collected": {
+              "files": {
+                "collect_list": [
+                  {
+                    "file_path": "/var/nginx-logs/access.log",
+                    "log_group_name": "${AccessLogGroup}",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/nginx-logs/error.log",
+                    "log_group_name": "${ErrorLogGroup}",
+                    "log_stream_name": "{instance_id}"
+                  },
+                  {
+                    "file_path": "/var/nginx-logs/metrics.log",
+                    "log_group_name": "${MetricsLogGroup}",
+                    "log_stream_name": "{instance_id}"
+                  }
+                ]
+              }
+            }
+          }
+        }
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - CWAgentConfig
+    Properties:
+      Family: !Sub '${AWS::StackName}-td'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - EC2
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      Volumes:
+        - Name: logs
+          DockerVolumeConfiguration:
+            Driver: local
+            Scope: task
+      ContainerDefinitions:
+        - Name: CORSRedirector
+          Essential: true
+          MemoryReservation: 256
+          Cpu: 1024
+          Image:
+            Fn::Join:
+              - ':'
+              - - Fn::ImportValue: !Sub 'cors-redirector-ecr-${ECRStackName}'
+                - !Ref ImageTag
+          PortMappings:
+            - ContainerPort: 80
+          LinuxParameters:
+            InitProcessEnabled: true
+          Environment:
+            - Name: REDIRECT_TARGET
+              Value: !Ref Redirect
+            - Name: MAX_CONNECTIONS
+              Value: !Ref MaxConnections
+          MountPoints:
+            - ContainerPath: /var/nginx-logs
+              SourceVolume: logs
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'TaskCloudWatchLogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'ecs'
+        - Name: cloudwatch-agent
+          MemoryReservation: 256
+          Image: amazon/cloudwatch-agent:latest
+          Secrets:
+            - Name: CW_CONFIG_CONTENT
+              ValueFrom: !Ref CWAgentConfig
+          VolumesFrom:
+            - SourceContainer: CORSRedirector
+              ReadOnly: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'TaskCloudWatchLogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'ecs'
+
+  ECSCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+        ManagedScaling:
+          # managed autoscaling does not seem to work correctly, does not want to scale in - we manage autoscaling ourselves
+          Status: DISABLED
+  ECSCapacityProviderAssociation:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref ECSCluster
+      CapacityProviders:
+        - !Ref ECSCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref ECSCapacityProvider
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - TCPListener
+    Properties:
+      ServiceName: !Sub '${AWS::StackName}-service'
+      Cluster: !Ref ECSCluster
+      LaunchType: EC2
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSContainerSG
+          Subnets:
+            - !Ref PrivateSubnetOne
+            - !Ref PrivateSubnetTwo
+      TaskDefinition: !Ref 'TaskDefinition'
+      LoadBalancers:
+        - ContainerName: CORSRedirector
+          ContainerPort: 80
+          TargetGroupArn: !Ref TargetGroup
+      PlacementStrategies:
+        - Type: spread
+          Field: attribute:ecs.availability-zone
+        - Type: spread
+          Field: instanceId
+
+  ################### Autoscaling #######################
+
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinContainers
+      MaxCapacity: !Ref MaxContainers
+      ResourceId: !Join ['/', ['service', !Ref ECSCluster, !GetAtt Service.Name]]
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  ECSScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-out'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: -1
+            MetricIntervalUpperBound: 0
+            ScalingAdjustment: 1
+          - MetricIntervalLowerBound: -2
+            MetricIntervalUpperBound: -1
+            ScalingAdjustment: 2
+          - MetricIntervalUpperBound: -2
+            ScalingAdjustment: 3
+  ECSScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ecs-scale-in'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        MetricAggregationType: Average
+        Cooldown: 600
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            MetricIntervalUpperBound: 1
+            ScalingAdjustment: -1
+          - MetricIntervalLowerBound: 1
+            MetricIntervalUpperBound: 2
+            ScalingAdjustment: -2
+          - MetricIntervalLowerBound: 2
+            ScalingAdjustment: -3
+  ECSScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ecs-scale-out'
+      AlarmDescription: !Sub '${AWS::StackName} ECS cluster is undersized'
+      AlarmActions:
+        - !Ref ECSScaleOutPolicy
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      Threshold: 0
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleContainers
+          Expression: !Sub 'IF(e4, (e1 - e4) / ${ContainerTPS})'
+  ECSScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ecs-scale-in'
+      AlarmDescription: !Sub '${AWS::StackName} ECS cluster is oversized'
+      AlarmActions:
+        - !Ref ECSScaleInPolicy
+      EvaluationPeriods: 15
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleContainers
+          Expression: !Sub 'IF(e4, (e1 - e4) / ${ContainerTPS})'
+
+  EC2ScaleOutPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ec2-scale-out'
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      StepAdjustments:
+        - MetricIntervalLowerBound: -1
+          MetricIntervalUpperBound: 0
+          ScalingAdjustment: 1
+        - MetricIntervalLowerBound: -2
+          MetricIntervalUpperBound: -1
+          ScalingAdjustment: 2
+        - MetricIntervalUpperBound: -2
+          ScalingAdjustment: 3
+  EC2ScaleInPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-ec2-scale-in'
+      PolicyType: StepScaling
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      StepAdjustments:
+        - MetricIntervalLowerBound: 0
+          MetricIntervalUpperBound: 1
+          ScalingAdjustment: -1
+        - MetricIntervalLowerBound: 1
+          MetricIntervalUpperBound: 2
+          ScalingAdjustment: -2
+        - MetricIntervalLowerBound: 2
+          ScalingAdjustment: -3
+  EC2ScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-scale-out'
+      AlarmDescription: !Sub '${AWS::StackName} EC2 ASG is undersized'
+      AlarmActions:
+        - !Ref EC2ScaleOutPolicy
+      EvaluationPeriods: 1
+      ComparisonOperator: LessThanThreshold
+      Threshold: 0
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumInstances
+          MetricStat:
+            Period: 60
+            Stat: SampleCount
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: StatusCheckFailed
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref AutoScalingGroup
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS} * ${ContainersPerInstance}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleInstances
+          Expression: !Sub 'IF(e4, (e1 - e4) / (${ContainerTPS} * ${ContainersPerInstance}))'
+  EC2ScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ec2-scale-in'
+      AlarmDescription: !Sub '${AWS::StackName} EC2 ASG is oversized'
+      AlarmActions:
+        - !Ref EC2ScaleInPolicy
+      EvaluationPeriods: 15
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 1
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LBRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumInstances
+          MetricStat:
+            Period: 60
+            Stat: SampleCount
+            Metric:
+              Namespace: AWS/EC2
+              MetricName: StatusCheckFailed
+              Dimensions:
+                - Name: AutoScalingGroupName
+                  Value: !Ref AutoScalingGroup
+        - Id: e1
+          ReturnData: False
+          Label: TotalTPSCapacity
+          Expression: !Sub 'm2 * ${ContainerTPS} * ${ContainersPerInstance}'
+        - Id: e2
+          ReturnData: False
+          Label: LoadBalancerTPS
+          Expression: 'm1 / 60'
+        - Id: e3
+          ReturnData: False
+          Label: TargetTPSCapacity
+          Expression: !Sub 'e2 + ${TargetSpareTPSCapacity}'
+        - Id: e4
+          ReturnData: False
+          Label: TargetMinTPSCapacity
+          Expression: !Sub 'IF(e3 > ${MinTPSCapacity}, e3, ${MinTPSCapacity})'
+        - Id: e5
+          ReturnData: True
+          Label: IdleInstances
+          Expression: !Sub 'IF(e4, (e1 - e4) / (${ContainerTPS} * ${ContainersPerInstance}))'
+
+  ################### Monitoring #######################
+
+  AlarmNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alarms'
+      DisplayName: !Sub 'Notifications for alarms related to ${AWS::StackName}'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+  AlarmNotificationPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlarmNotification
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "cloudwatch.amazonaws.com"
+            Action: SNS:Publish
+            Resource: !Ref AlarmNotification
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub 'arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*'
+              StringEquals:
+                aws:SourceAccount: !Sub '${AWS::AccountId}'
+  LatencyMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterName: Latency
+      FilterPattern: '{$.Latency = *}'
+      LogGroupName: !Ref MetricsLogGroup
+      MetricTransformations:
+        - MetricValue: $.Latency
+          MetricName: Latency
+          Unit: Seconds
+          MetricNamespace: !Sub '${AWS::StackName}'
+  FaultMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterName: Fault
+      FilterPattern: '{$.StatusCode != 301 && ($.StatusCode < 400 || $.StatusCode >= 500)}'
+      LogGroupName: !Ref MetricsLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricName: Fault
+          Unit: Count
+          DefaultValue: 0
+          MetricNamespace: !Sub '${AWS::StackName}'
+  ErrorMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterName: Error
+      FilterPattern: '{$.StatusCode >= 400 && $.StatusCode < 500}'
+      LogGroupName: !Ref MetricsLogGroup
+      MetricTransformations:
+        - MetricValue: 1
+          MetricName: Error
+          Unit: Count
+          DefaultValue: 0
+          MetricNamespace: !Sub '${AWS::StackName}'
+
+  HighLoadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-load'
+      AlarmDescription: !Sub '${AWS::StackName} Incoming requests are high compared to available capacity'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Load', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Load', 'M']
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 90
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LoadBalancerRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: True
+          Label: Load % (LB TPS / Available TPS capacity)
+          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+  LowLoadAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-low-load'
+      AlarmDescription: !Sub '${AWS::StackName} is consistently oversized'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      DatapointsToAlarm: 1440
+      EvaluationPeriods: 1440
+      ComparisonOperator: LessThanThreshold
+      Threshold: 50
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: LoadBalancerRequestsPerMinute
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: NewFlowCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Id: m2
+          ReturnData: False
+          Label: NumContainers
+          MetricStat:
+            Period: 60
+            Stat: Average
+            Metric:
+              Namespace: AWS/NetworkELB
+              MetricName: HealthyHostCount
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt LoadBalancer.LoadBalancerFullName
+                - Name: TargetGroup
+                  Value: !GetAtt TargetGroup.TargetGroupFullName
+        - Id: e1
+          ReturnData: True
+          Label: Load % (LB TPS / Available TPS capacity)
+          Expression: !Sub 'm1 / (m2 * ${ContainerTPS} * 60) * 100'
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-high-latency'
+      AlarmDescription: !Sub '${AWS::StackName} latency too high'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Latency', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Latency', 'M']
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !FindInMap ['AlarmThresholds', 'Latency', 'Threshold']
+      Metrics:
+        - Id: m1
+          ReturnData: False
+          Label: Latency (s)
+          MetricStat:
+            Period: 60
+            Stat: p99
+            Metric:
+              Namespace: !Sub '${AWS::StackName}'
+              MetricName: Latency
+        - Id: e1
+          ReturnData: True
+          Label: Latency
+          Expression: m1 * 1000
+  FaultAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-faults'
+      AlarmDescription: !Sub '${AWS::StackName} is erroring out'
+      AlarmActions:
+        - !Ref AlarmNotification
+      OKActions:
+        - !Ref AlarmNotification
+      DatapointsToAlarm: !FindInMap ['AlarmThresholds', 'Fault', 'N']
+      EvaluationPeriods: !FindInMap ['AlarmThresholds', 'Fault', 'M']
+      Threshold: !FindInMap ['AlarmThresholds', 'Fault', 'Threshold']
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: breaching
+      Metrics:
+        - Id: m1
+          ReturnData: True
+          Label: Fault
+          MetricStat:
+            Period: 60
+            Stat: Sum
+            Metric:
+              Namespace: !Sub '${AWS::StackName}'
+              MetricName: Fault
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}'
+      DashboardBody: !Sub
+        - >
+          {
+            "periodOverride": "inherit",
+            "widgets": [
+              {
+                "height": 8,
+                "width": 10,
+                "y": 0,
+                "x": 0,
+                "type": "metric",
+                "properties": {
+                  "metrics": [
+                    [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LoadBalancerRequestsPerMinute", "visible": false, "stat": "Sum" } ],
+                    [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
+                    [ { "id": "e1", "expression": "m1 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Load % (LB TPS / Available TPS capacity)", "visible": true, "region": "${AWS::Region}", "color": "#FF5D64" } ],
+                    [ { "expression": "m3 / (m2 * ${ContainerTPS} * 60) * 100", "label": "Active Conn % (LB Active conns / Available TPS capacity)", "id": "e2", "yAxis": "right", "region": "${AWS::Region}", "color": "#3A92CF" } ],
+                    [ "AWS/NetworkELB", "ActiveFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m3", "visible": false, "label": "LoadBalancerActiveConns" } ]
+                  ],
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 60,
+                  "annotations": {
+                    "horizontal": [
+                      {
+                        "label": "${LoadN} datapoints in ${LoadM} minutes",
+                        "value": ${LoadThreshold}
+                      }
+                    ]
+                  },
+                  "title": "Load",
+                  "stat": "Average",
+                  "yAxis": {
+                    "left": {
+                      "showUnits": false,
+                      "label": "%"
+                    },
+                    "right": {
+                      "showUnits": false,
+                      "label": "%"
+                    }          
+                  }
+                }
+              },
+              {
+                "height": 8,
+                "width": 10,
+                "y": 0,
+                "x": 10,
+                "type": "metric",
+                "properties": {
+                  "metrics": [
+                    [ "AWS/NetworkELB", "NewFlowCount", "LoadBalancer", "${LoadBalancer}", { "id": "m1", "label": "LBReqPerMinute", "visible": false, "stat": "Sum" } ],
+                    [ ".", "HealthyHostCount", "TargetGroup", "${TargetGroup}", "LoadBalancer", "${LoadBalancer}", { "id": "m2", "label": "NumContainers", "visible": false } ],
+                    [ { "id": "e1", "label": "TPS (at load balancer)", "expression": "m1 / 60", "visible": true, "region": "${AWS::Region}" } ],
+                    [ { "expression": "m3 / 60", "label": "TPS (at service)", "id": "e3", "region": "${AWS::Region}" } ],
+                    [ { "expression": "m2 * ${ContainerTPS}", "label": "Capacity", "id": "e2", "region": "${AWS::Region}" } ],
+                    [ "${AWS::StackName}", "Latency", { "id": "m3", "visible": false, "stat": "SampleCount", "label": "ECSReqPerMinute" } ]
+                  ],
+                  "region": "${AWS::Region}",
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "period": 60,
+                  "title": "Traffic",
+                  "stat": "Average",
+                  "yAxis": {
+                    "left": {
+                      "showUnits": false,
+                      "label": "Requests/second"
+                    }
+                  }
+                }
+              },
+              {
+                "type": "metric",
+                "x": 0,
+                "y": 8,
+                "width": 10,
+                "height": 8,
+                "properties": {
+                  "metrics": [
+                    [ { "expression": "m1 * 1000", "label": "Latency (p99)", "id": "e1", "region": "${AWS::Region}", "color": "#FF5D64" } ],
+                    [ "${AWS::StackName}", "Latency", { "id": "m1", "visible": false } ]
+                  ],
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "stat": "p99",
+                  "period": 60,
+                  "title": "Latency",
+                  "yAxis": {
+                    "left": {
+                      "label": "Milliseconds",
+                      "showUnits": false
+                    }
+                  },
+                  "annotations": {
+                    "horizontal": [
+                      {
+                        "label": "${LatencyN} datapoints in ${LatencyM} minutes",
+                        "value": ${LatencyThreshold}
+                      }
+                    ]
+                  }
+                }
+              },
+              {
+                "type": "metric",
+                "x": 10,
+                "y": 8,
+                "width": 10,
+                "height": 8,
+                "properties": {
+                  "metrics": [
+                    [ "${AWS::StackName}", "Fault" , {"label": "Fault (not 301, not 4xx)", "color": "#FF5D64"}],
+                    [ "${AWS::StackName}", "Error" , {"label": "Error (4xx)", "yAxis": "right", "color": "#3A92CF"}]
+                  ],
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "stat": "Sum",
+                  "period": 60,
+                  "title": "Errors",
+                  "yAxis": {
+                    "left": {
+                      "label": "Count",
+                      "showUnits": false
+                    },
+                    "right": {
+                      "label": "Count",
+                      "showUnits": false
+                    }
+                  },
+                  "annotations": {
+                    "horizontal": [
+                      {
+                        "label": "${FaultN} datapoints in ${FaultM} minutes",
+                        "value": ${FaultThreshold}
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        - LoadBalancer: !GetAtt LoadBalancer.LoadBalancerFullName
+          TargetGroup: !GetAtt TargetGroup.TargetGroupFullName
+          LoadThreshold: !FindInMap ['AlarmThresholds', 'Load', 'Threshold']
+          LoadN: !FindInMap ['AlarmThresholds', 'Load', 'N']
+          LoadM: !FindInMap ['AlarmThresholds', 'Load', 'M']
+          LatencyThreshold: !FindInMap ['AlarmThresholds', 'Latency', 'Threshold']
+          LatencyN: !FindInMap ['AlarmThresholds', 'Latency', 'N']
+          LatencyM: !FindInMap ['AlarmThresholds', 'Latency', 'M']
+          FaultThreshold: !FindInMap ['AlarmThresholds', 'Fault', 'Threshold']
+          FaultN: !FindInMap ['AlarmThresholds', 'Fault', 'N']
+          FaultM: !FindInMap ['AlarmThresholds', 'Fault', 'M']
+
+Outputs:
+  Cluster:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-cluster'
+  Service:
+    Description: ECS service name
+    Value: !GetAtt Service.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-service'
+  LoadBalancer:
+    Description: Load balancer DNS name
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-lb'
